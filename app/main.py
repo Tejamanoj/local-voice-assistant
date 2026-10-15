@@ -17,20 +17,24 @@ from PySide6.QtWidgets import (
     QLabel,
 )
 
+from app.memory.store import MemoryStore
+
+
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "qwen2.5:3b"
 
 SYSTEM_PROMPT = """
 You are Spidey, a helpful local Windows AI assistant.
 
-Rules:
-- Remember relevant information from earlier messages in this chat.
-- Be honest about what you can and cannot do.
-- Never claim to have performed a computer action unless a connected
-  tool actually performed and verified that action.
-- For now, you can chat, explain, and answer questions. You do not
-  yet have tools to control Windows.
-- Keep answers clear and useful.
+Be clear and honest about your capabilities.
+You can chat and answer questions using your local AI model.
+You do not yet have tools to control Windows or execute computer actions.
+
+Conversation history is provided during the current chat session.
+Some explicitly saved facts may be provided as additional context.
+
+Never claim to have performed an action unless a connected tool
+actually performed and verified that action.
 """
 
 
@@ -40,7 +44,7 @@ class AIWorker(QThread):
 
     def __init__(self, messages):
         super().__init__()
-        self.messages = messages.copy()
+        self.messages = [dict(message) for message in messages]
 
     def run(self):
         try:
@@ -83,13 +87,14 @@ class SpideyWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Spidey AI")
-        self.resize(800, 600)
+        self.resize(850, 620)
+
+        self.memory = MemoryStore()
+        self.worker = None
 
         self.messages = [
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
-
-        self.worker = None
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -99,36 +104,40 @@ class SpideyWindow(QMainWindow):
         title = QLabel("SPIDEY AI")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(
-            "font-size: 25px; font-weight: bold; padding: 8px;"
+            "font-size: 26px; font-weight: bold; padding: 8px;"
         )
 
-        subtitle = QLabel("Local AI assistant · Powered by Ollama")
+        subtitle = QLabel(
+            "Local AI assistant · Ollama · Persistent local memory"
+        )
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet("color: gray;")
 
         self.chat = QTextEdit()
         self.chat.setReadOnly(True)
-        self.chat.setPlaceholderText("Your conversation appears here.")
         self.chat.append(
-            "Spidey: Hello! I'm connected to your local AI model. "
-            "I can chat with you and remember earlier messages "
-            "while this window remains open."
+            "Spidey: Hello! I'm running locally.\n\n"
+            "You can chat with me or use these memory commands:\n"
+            "• remember: project_name = Spidey AI\n"
+            "• recall: project_name\n"
+            "• memories\n"
+            "• forget: project_name"
         )
 
         self.input = QLineEdit()
-        self.input.setPlaceholderText("Type a message...")
+        self.input.setPlaceholderText("Message Spidey...")
         self.input.returnPressed.connect(self.send_message)
 
         self.send_button = QPushButton("Send")
         self.send_button.clicked.connect(self.send_message)
 
-        self.clear_button = QPushButton("New Chat")
-        self.clear_button.clicked.connect(self.new_chat)
+        self.new_chat_button = QPushButton("New Chat")
+        self.new_chat_button.clicked.connect(self.new_chat)
 
         input_row = QHBoxLayout()
         input_row.addWidget(self.input, 1)
         input_row.addWidget(self.send_button)
-        input_row.addWidget(self.clear_button)
+        input_row.addWidget(self.new_chat_button)
 
         layout.addWidget(title)
         layout.addWidget(subtitle)
@@ -153,7 +162,7 @@ class SpideyWindow(QMainWindow):
                 color: white;
                 border: none;
                 border-radius: 8px;
-                padding: 10px 16px;
+                padding: 10px 14px;
                 font-weight: bold;
             }
             QPushButton:disabled {
@@ -161,57 +170,144 @@ class SpideyWindow(QMainWindow):
             }
         """)
 
+    def handle_memory_command(self, message):
+        text = message.strip()
+
+        if text.lower().startswith("remember:"):
+            content = text[len("remember:"):].strip()
+
+            if "=" not in content:
+                return (
+                    "Use this format: "
+                    "remember: project_name = Spidey AI"
+                )
+
+            key, value = content.split("=", 1)
+
+            try:
+                self.memory.save(key, value)
+                return f"Saved memory: {key.strip()} = {value.strip()}"
+            except (ValueError, OSError) as exc:
+                return f"Could not save memory: {exc}"
+
+        if text.lower().startswith("recall:"):
+            key = text[len("recall:"):].strip()
+
+            if not key:
+                return "Please provide a key after 'recall:'."
+
+            value = self.memory.get(key)
+
+            if value is None:
+                return f"No saved memory found for '{key}'."
+
+            return f"{key} = {value}"
+
+        if text.lower() == "memories":
+            saved = self.memory.list_all()
+
+            if not saved:
+                return "No saved memories yet."
+
+            return "\n".join(
+                f"{item['memory_key']} = {item['memory_value']}"
+                for item in saved
+            )
+
+        if text.lower().startswith("forget:"):
+            key = text[len("forget:"):].strip()
+
+            if not key:
+                return "Please provide a key after 'forget:'."
+
+            if self.memory.delete(key):
+                return f"Deleted saved memory: {key}"
+
+            return f"No saved memory found for '{key}'."
+
+        return None
+
     def send_message(self):
         message = self.input.text().strip()
 
-        if not message or (
-            self.worker is not None and self.worker.isRunning()
-        ):
+        if not message:
+            return
+
+        if self.worker is not None and self.worker.isRunning():
             return
 
         self.input.clear()
         self.chat.append(f"\nYou: {message}")
 
-        self.messages.append({
+        # Handle explicit memory operations locally.
+        memory_reply = self.handle_memory_command(message)
+
+        if memory_reply is not None:
+            self.chat.append(f"\nSpidey: {memory_reply}")
+            return
+
+        # Include saved facts as context for normal AI questions.
+        saved_memories = self.memory.list_all()
+
+        memory_context = ""
+        if saved_memories:
+            memory_context = (
+                "\n\nSaved user facts for context:\n"
+                + "\n".join(
+                    f"- {item['memory_key']}: {item['memory_value']}"
+                    for item in saved_memories
+                )
+                + "\nUse these facts when relevant, but do not claim "
+                  "they came from the current chat."
+            )
+
+        request_messages = [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT + memory_context,
+            }
+        ]
+
+        # Keep conversation history separate from memory context.
+        request_messages.extend(self.messages[1:])
+        request_messages.append({
             "role": "user",
             "content": message,
         })
 
         self.send_button.setEnabled(False)
-        self.clear_button.setEnabled(False)
+        self.new_chat_button.setEnabled(False)
         self.input.setEnabled(False)
-
         self.chat.append("Spidey: Thinking...")
 
-        # Copy the complete conversation, including prior turns.
-        self.worker = AIWorker(self.messages)
+        self.worker = AIWorker(request_messages)
         self.worker.succeeded.connect(self.on_ai_success)
         self.worker.failed.connect(self.on_ai_error)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.start()
+
+        # Add the user message to session history after launching.
+        self.messages.append({
+            "role": "user",
+            "content": message,
+        })
 
     def on_ai_success(self, reply):
         self.messages.append({
             "role": "assistant",
             "content": reply,
         })
-
         self.chat.append(f"\nSpidey: {reply}")
 
     def on_ai_error(self, error):
-        # Remove the latest user message so a failed request doesn't
-        # leave an unmatched turn in the conversation history.
-        if (
-            self.messages
-            and self.messages[-1]["role"] == "user"
-        ):
+        if self.messages and self.messages[-1]["role"] == "user":
             self.messages.pop()
 
         self.chat.append(f"\nSpidey error: {error}")
 
     def on_worker_finished(self):
         self.send_button.setEnabled(True)
-        self.clear_button.setEnabled(True)
+        self.new_chat_button.setEnabled(True)
         self.input.setEnabled(True)
         self.input.setFocus()
         self.worker = None
@@ -227,7 +323,7 @@ class SpideyWindow(QMainWindow):
         self.chat.clear()
         self.chat.append(
             "Spidey: New conversation started. "
-            "Previous chat history has been cleared from this session."
+            "Saved SQLite memories remain available."
         )
 
 
