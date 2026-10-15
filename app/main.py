@@ -5,6 +5,7 @@ import urllib.request
 import urllib.error
 
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -15,6 +16,10 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QLabel,
+    QSystemTrayIcon,
+    QMenu,
+    QMessageBox,
+    QStyle,
 )
 
 from app.memory.store import MemoryStore
@@ -25,14 +30,8 @@ MODEL_NAME = "qwen2.5:3b"
 
 SYSTEM_PROMPT = """
 You are Spidey, a helpful local Windows AI assistant.
-
-Be clear and honest about your capabilities.
 You can chat and answer questions using your local AI model.
-You do not yet have tools to control Windows or execute computer actions.
-
-Conversation history is provided during the current chat session.
-Some explicitly saved facts may be provided as additional context.
-
+You do not yet have tools to control Windows.
 Never claim to have performed an action unless a connected tool
 actually performed and verified that action.
 """
@@ -71,15 +70,13 @@ class AIWorker(QThread):
 
             self.succeeded.emit(reply)
 
-        except urllib.error.URLError as exc:
+        except (urllib.error.URLError, TimeoutError) as exc:
             self.failed.emit(
-                "Could not connect to Ollama. Check that Ollama is running.\n"
+                "Could not connect to Ollama or the request timed out.\n"
                 f"Details: {exc}"
             )
-        except (ValueError, KeyError, json.JSONDecodeError) as exc:
-            self.failed.emit(f"Could not process the AI response: {exc}")
         except Exception as exc:
-            self.failed.emit(f"Unexpected error: {exc}")
+            self.failed.emit(f"AI request failed: {exc}")
 
 
 class SpideyWindow(QMainWindow):
@@ -91,6 +88,7 @@ class SpideyWindow(QMainWindow):
 
         self.memory = MemoryStore()
         self.worker = None
+        self.allow_quit = False
 
         self.messages = [
             {"role": "system", "content": SYSTEM_PROMPT}
@@ -98,8 +96,6 @@ class SpideyWindow(QMainWindow):
 
         central = QWidget()
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(12)
 
         title = QLabel("SPIDEY AI")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -107,21 +103,19 @@ class SpideyWindow(QMainWindow):
             "font-size: 26px; font-weight: bold; padding: 8px;"
         )
 
-        subtitle = QLabel(
-            "Local AI assistant · Ollama · Persistent local memory"
-        )
+        subtitle = QLabel("Local AI assistant · Ollama · SQLite memory")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setStyleSheet("color: gray;")
 
         self.chat = QTextEdit()
         self.chat.setReadOnly(True)
         self.chat.append(
             "Spidey: Hello! I'm running locally.\n\n"
-            "You can chat with me or use these memory commands:\n"
-            "• remember: project_name = Spidey AI\n"
-            "• recall: project_name\n"
-            "• memories\n"
-            "• forget: project_name"
+            "Memory commands:\n"
+            "remember: project_name = Spidey AI\n"
+            "recall: project_name\n"
+            "memories\n"
+            "forget: project_name\n\n"
+            "Closing this window hides Spidey in the system tray."
         )
 
         self.input = QLineEdit()
@@ -147,9 +141,7 @@ class SpideyWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.setStyleSheet("""
-            QMainWindow {
-                background-color: #f5f7fb;
-            }
+            QMainWindow { background-color: #f5f7fb; }
             QTextEdit, QLineEdit {
                 background-color: white;
                 border: 1px solid #d5dbe5;
@@ -165,10 +157,68 @@ class SpideyWindow(QMainWindow):
                 padding: 10px 14px;
                 font-weight: bold;
             }
-            QPushButton:disabled {
-                background-color: #a0aec0;
-            }
+            QPushButton:disabled { background-color: #a0aec0; }
         """)
+
+        self.setup_tray()
+
+    def setup_tray(self):
+        self.tray = QSystemTrayIcon(self)
+
+        icon = self.style().standardIcon(
+            QStyle.StandardPixmap.SP_ComputerIcon
+        )
+        self.setWindowIcon(icon)
+        self.tray.setIcon(icon)
+        self.tray.setToolTip("Spidey AI")
+
+        menu = QMenu()
+
+        show_action = QAction("Show Spidey", self)
+        show_action.triggered.connect(self.show_window)
+
+        hide_action = QAction("Hide Spidey", self)
+        hide_action.triggered.connect(self.hide)
+
+        quit_action = QAction("Quit Spidey", self)
+        quit_action.triggered.connect(self.quit_application)
+
+        menu.addAction(show_action)
+        menu.addAction(hide_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self.on_tray_activated)
+        self.tray.show()
+
+    def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.show_window()
+
+    def show_window(self):
+        self.show()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_application(self):
+        self.allow_quit = True
+        self.tray.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        if self.allow_quit:
+            event.accept()
+        else:
+            event.ignore()
+            self.hide()
+            self.tray.showMessage(
+                "Spidey AI",
+                "Spidey is still running in the system tray.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2500,
+            )
 
     def handle_memory_command(self, message):
         text = message.strip()
@@ -177,10 +227,7 @@ class SpideyWindow(QMainWindow):
             content = text[len("remember:"):].strip()
 
             if "=" not in content:
-                return (
-                    "Use this format: "
-                    "remember: project_name = Spidey AI"
-                )
+                return "Use: remember: project_name = Spidey AI"
 
             key, value = content.split("=", 1)
 
@@ -194,14 +241,14 @@ class SpideyWindow(QMainWindow):
             key = text[len("recall:"):].strip()
 
             if not key:
-                return "Please provide a key after 'recall:'."
+                return "Please provide a memory key."
 
             value = self.memory.get(key)
-
-            if value is None:
-                return f"No saved memory found for '{key}'."
-
-            return f"{key} = {value}"
+            return (
+                f"{key} = {value}"
+                if value is not None
+                else f"No saved memory found for '{key}'."
+            )
 
         if text.lower() == "memories":
             saved = self.memory.list_all()
@@ -218,7 +265,7 @@ class SpideyWindow(QMainWindow):
             key = text[len("forget:"):].strip()
 
             if not key:
-                return "Please provide a key after 'forget:'."
+                return "Please provide a memory key."
 
             if self.memory.delete(key):
                 return f"Deleted saved memory: {key}"
@@ -230,35 +277,27 @@ class SpideyWindow(QMainWindow):
     def send_message(self):
         message = self.input.text().strip()
 
-        if not message:
-            return
-
-        if self.worker is not None and self.worker.isRunning():
+        if not message or (
+            self.worker is not None and self.worker.isRunning()
+        ):
             return
 
         self.input.clear()
         self.chat.append(f"\nYou: {message}")
 
-        # Handle explicit memory operations locally.
         memory_reply = self.handle_memory_command(message)
 
         if memory_reply is not None:
             self.chat.append(f"\nSpidey: {memory_reply}")
             return
 
-        # Include saved facts as context for normal AI questions.
-        saved_memories = self.memory.list_all()
-
+        saved = self.memory.list_all()
         memory_context = ""
-        if saved_memories:
-            memory_context = (
-                "\n\nSaved user facts for context:\n"
-                + "\n".join(
-                    f"- {item['memory_key']}: {item['memory_value']}"
-                    for item in saved_memories
-                )
-                + "\nUse these facts when relevant, but do not claim "
-                  "they came from the current chat."
+
+        if saved:
+            memory_context = "\nSaved facts:\n" + "\n".join(
+                f"- {item['memory_key']}: {item['memory_value']}"
+                for item in saved
             )
 
         request_messages = [
@@ -267,13 +306,13 @@ class SpideyWindow(QMainWindow):
                 "content": SYSTEM_PROMPT + memory_context,
             }
         ]
-
-        # Keep conversation history separate from memory context.
         request_messages.extend(self.messages[1:])
         request_messages.append({
             "role": "user",
             "content": message,
         })
+
+        self.messages.append({"role": "user", "content": message})
 
         self.send_button.setEnabled(False)
         self.new_chat_button.setEnabled(False)
@@ -286,23 +325,13 @@ class SpideyWindow(QMainWindow):
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.start()
 
-        # Add the user message to session history after launching.
-        self.messages.append({
-            "role": "user",
-            "content": message,
-        })
-
     def on_ai_success(self, reply):
-        self.messages.append({
-            "role": "assistant",
-            "content": reply,
-        })
+        self.messages.append({"role": "assistant", "content": reply})
         self.chat.append(f"\nSpidey: {reply}")
 
     def on_ai_error(self, error):
         if self.messages and self.messages[-1]["role"] == "user":
             self.messages.pop()
-
         self.chat.append(f"\nSpidey error: {error}")
 
     def on_worker_finished(self):
@@ -316,20 +345,24 @@ class SpideyWindow(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             return
 
-        self.messages = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
-
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.chat.clear()
         self.chat.append(
-            "Spidey: New conversation started. "
-            "Saved SQLite memories remain available."
+            "Spidey: New chat started. Saved SQLite memories remain."
         )
 
 
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Spidey AI")
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        QMessageBox.warning(
+            None,
+            "System tray unavailable",
+            "Windows reports that the system tray is unavailable. "
+            "Spidey will still open, but tray behavior may not work.",
+        )
 
     window = SpideyWindow()
     window.show()
