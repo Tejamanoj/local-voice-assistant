@@ -6,3 +6,8 @@ logs/
 .pytest_cache/
 
 spidey_memory.db
+desktop.ini
+*.tmp
+spidey_audio_state.json
+spidey_orb_control.json
+
